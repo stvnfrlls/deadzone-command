@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/game/rtsscene.ts","./src/game/bridge.ts","./src/game/map.ts","./src/game/model.ts","./vite.config.ts"],"version":"5.9.3"}
