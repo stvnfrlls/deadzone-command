@@ -1,4 +1,5 @@
 export const TILE = 28;
+export const GROUND_TILE_HEIGHT = 20;
 export const MAP_W = 82;
 export const MAP_H = 58;
 export const SURVIVORS_PER_GROUP = 4;
@@ -18,16 +19,16 @@ export const TERRAIN_COLORS: Record<Environment, Record<Terrain, number>> = {
   islands: { grass: 0x416049, forest: 0x2b4839, sand: 0xa18b5e, road: 0x555b52, bridge: 0x756d58, water: 0x1c5365, ruin: 0x5f6256 },
   downtown: { grass: 0x444b4c, forest: 0x33483e, sand: 0x817664, road: 0x343c42, bridge: 0x67655c, water: 0x16475a, ruin: 0x535052 },
 };
-export type UnitKind = 'worker' | 'rifleman' | 'gunner' | 'sniper' | 'tank' | 'apc' | 'raider' | 'raiderTank' | 'walker' | 'runner' | 'brute';
+export type UnitKind = 'worker' | 'rifleman' | 'gunner' | 'sniper' | 'scout' | 'demolition' | 'tank' | 'apc' | 'reconBuggy' | 'mortarCarrier' | 'raider' | 'raiderTank' | 'walker' | 'runner' | 'brute';
 export type BuildingKind = 'hq' | 'barracks' | 'power' | 'scrapyard' | 'refinery' | 'farm' | 'warFactory' | 'research' | 'garage' | 'armory' | 'turret' | 'wall' | 'radar' | 'hospital' | 'workshop' | 'depot' | 'academy';
 export type ResourceKey = 'scrap' | 'oil' | 'food';
 export type Resources = Record<ResourceKey, number>;
 export type Cost = Partial<Resources>;
 export const RESOURCE_DEPOSITS = {
-  scrap: { label: 'Metal', color: 0xd9bc7c, amount: 360 },
-  oil: { label: 'Oil', color: 0xe49b6b, amount: 264 },
-  food: { label: 'Food', color: 0xa6ce80, amount: 288 },
-} satisfies Record<ResourceKey, { label: string; color: number; amount: number }>;
+  scrap: { label: 'Metal', icon: '◈', color: 0xd9bc7c, amount: 360 },
+  oil: { label: 'Oil', icon: '●', color: 0xe49b6b, amount: 264 },
+  food: { label: 'Food', icon: '◆', color: 0xa6ce80, amount: 288 },
+} satisfies Record<ResourceKey, { label: string; icon: string; color: number; amount: number }>;
 export interface StructureDef {
   label: string;
   short: string;
@@ -52,6 +53,8 @@ export interface UnitDef {
   buildTime: number;
   building?: BuildingKind;
   vehicle?: boolean;
+  sight?: number;
+  structureDamageMultiplier?: number;
 }
 export interface TechDef {
   label: string;
@@ -86,8 +89,12 @@ export const UNITS: Record<UnitKind, UnitDef> = {
   rifleman: { label: 'Rifleman', description: 'Versatile combat infantry.', cost: { scrap: 45, food: 10 }, hp: 65, speed: 68, range: 7 * TILE, damage: 9, cooldown: 0.9, buildTime: 4, building: 'barracks' },
   gunner: { label: 'Heavy Gunner', description: 'Suppresses hordes and armored raiders.', cost: { scrap: 85, food: 16 }, hp: 105, speed: 54, range: 121, damage: 16, cooldown: 1.15, buildTime: 7, building: 'barracks' },
   sniper: { label: 'Sniper', description: 'Long-range infantry support.', cost: { scrap: 105, food: 15 }, hp: 48, speed: 62, range: 245, damage: 32, cooldown: 2.5, buildTime: 8, building: 'barracks' },
-  tank: { label: 'Battle Tank', description: 'Heavy armor for base assaults.', cost: { scrap: 225, oil: 100 }, hp: 380, speed: 46, range: 170, damage: 46, cooldown: 2.2, buildTime: 16, building: 'warFactory', vehicle: true },
+  scout: { label: 'Scout', description: 'Fast infantry with an extended sight range.', cost: { scrap: 55, food: 12 }, hp: 44, speed: 105, range: 126, damage: 7, cooldown: .75, buildTime: 4, building: 'barracks', sight: 10 },
+  demolition: { label: 'Demolition Trooper', description: 'Short-range rockets deal double damage to structures.', cost: { scrap: 115, food: 24 }, hp: 88, speed: 59, range: 112, damage: 23, cooldown: 1.45, buildTime: 7, building: 'barracks', structureDamageMultiplier: 2 },
   apc: { label: 'APC', description: 'Fast armored support vehicle.', cost: { scrap: 145, oil: 65 }, hp: 215, speed: 77, range: 105, damage: 14, cooldown: 0.9, buildTime: 11, building: 'warFactory', vehicle: true },
+  tank: { label: 'Battle Tank', description: 'Heavy armor for base assaults.', cost: { scrap: 225, oil: 100 }, hp: 380, speed: 46, range: 170, damage: 46, cooldown: 2.2, buildTime: 16, building: 'warFactory', vehicle: true },
+  reconBuggy: { label: 'Recon Buggy', description: 'Fast, lightly armored recon vehicle with wide visibility.', cost: { scrap: 115, oil: 42 }, hp: 126, speed: 122, range: 140, damage: 10, cooldown: .58, buildTime: 8, building: 'warFactory', vehicle: true, sight: 12 },
+  mortarCarrier: { label: 'Mortar Carrier', description: 'Slow armored vehicle with long-range fire support.', cost: { scrap: 195, oil: 82 }, hp: 175, speed: 42, range: 336, damage: 38, cooldown: 2.3, buildTime: 15, building: 'warFactory', vehicle: true },
   raider: { label: 'Raider', description: 'Armed scavenger.', cost: {}, hp: 69, speed: 62, range: 105, damage: 9, cooldown: 1.0, buildTime: 0 },
   raiderTank: { label: 'Raider Technical', description: 'Improvised armored vehicle.', cost: {}, hp: 190, speed: 56, range: 143, damage: 20, cooldown: 1.6, buildTime: 0, vehicle: true },
   walker: { label: 'Walker', description: 'Slow but persistent infected.', cost: {}, hp: 37, speed: 29, range: 18, damage: 7, cooldown: 1.2, buildTime: 0 },

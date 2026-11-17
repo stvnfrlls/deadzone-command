@@ -1,21 +1,36 @@
 import Phaser from 'phaser';
+import { createN64BuildingTexture, createN64SurvivorTexture, createN64UnitTexture, n64PoseDuration, n64UnitFrame, type N64UnitPose } from './n64Visuals';
 import { action, publish, registerController, type GameController } from './bridge';
 import { center, createMap, createResourceNodes, createSurvivorSites, findPath, hasLineOfSight, legacyPlayerStart, RAIDER_BASE_COUNT, seededRandom, walkable } from './map';
-import { MAP_H, MAP_W, TILE, STORAGE_KEY, RESOURCE_DEPOSITS, STRUCTURES, SURVIVORS_PER_GROUP, SURVIVOR_TARGET, TERRAIN_COLORS, TECH, UNITS, type BuildingData, type BuildingKind, type Faction, type GameSave, type MapSite, type ResearchJob, type Resources, type RestorationProgress, type SurvivorGroupData, type TechId, type TileMap, type UiSnapshot, type UnitData, type UnitKind } from './model';
+import { GROUND_TILE_HEIGHT, MAP_H, MAP_W, TILE, STORAGE_KEY, RESOURCE_DEPOSITS, STRUCTURES, SURVIVORS_PER_GROUP, SURVIVOR_TARGET, TERRAIN_COLORS, TECH, UNITS, type BuildingData, type BuildingKind, type Faction, type GameSave, type MapSite, type ResearchJob, type ResourceKey, type Resources, type RestorationProgress, type SurvivorGroupData, type TechId, type TileMap, type UiSnapshot, type UnitData, type UnitKind } from './model';
 
 type Point = { x: number; y: number };
-type Unit = UnitData & { sprite: Phaser.GameObjects.Image; path: Point[]; goal: Point | null; attackId: number | null; nextPath: number; patrol: boolean; holdingPosition: boolean; gatherProgress: number };
+type UnitVisual = {
+  pose: N64UnitPose;
+  since: number;
+  attackAt: number;
+  hitAt: number;
+  workUntil: number;
+  gait: 'idle' | 'walk' | 'run';
+  facing: number;
+};
+type Unit = UnitData & { sprite: Phaser.GameObjects.Image; path: Point[]; goal: Point | null; attackId: number | null; nextPath: number; patrol: boolean; holdingPosition: boolean; gatherProgress: number; visual: UnitVisual };
+type DefeatedSprite = { sprite: Phaser.GameObjects.Image; tile: Point; faction: Faction; age: number };
 type Building = BuildingData & { sprite: Phaser.GameObjects.Image; label: Phaser.GameObjects.Text };
 type SurvivorGroup = SurvivorGroupData & { sprite: Phaser.GameObjects.Image; label: Phaser.GameObjects.Text; path: Point[]; nextPath: number };
 type Shot = { from: Point; to: Point; age: number; flight: number; distance: number; color: number; heavy: boolean };
-const GROUND_SCALE = 20 / TILE;
-const GROUND_TILE_HEIGHT = TILE * GROUND_SCALE;
+type IncomePopup = { label: Phaser.GameObjects.Container; originY: number; age: number };
+const GROUND_SCALE = GROUND_TILE_HEIGHT / TILE;
 const BUILDING_HEADROOM = 30;
 const UNIT_HEIGHT = 30;
 const UNIT_FEET = 24;
+const N64_VISUALS = true; // Set false to keep the original pixel sprites.
 const GUARD_TURRET_RANGE = 180;
 const WORKER_CAPACITY = 24;
 const GATHER_SECONDS = 2.1;
+const INCOME_POPUP_SECONDS = 1.45;
+const DOUBLE_CLICK_WINDOW_MS = 420;
+const NEARBY_SELECTION_RADIUS = 8 * TILE;
 const freshTech = (): Record<TechId, number> => ({ cure: 0, weapons: 0, armor: 0, defenses: 0, engines: 0, vehicleArmor: 0, vehicleWeapons: 0 });
 const near = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const isVehicle = (kind: UnitKind) => Boolean(UNITS[kind].vehicle);
@@ -55,7 +70,12 @@ export class RtsScene extends Phaser.Scene implements GameController {
   fogOverlay!: Phaser.GameObjects.Graphics;
   shotOverlay!: Phaser.GameObjects.Graphics;
   private shots: Shot[] = [];
+  private defeatedSprites: DefeatedSprite[] = [];
   private resourceLabels: Phaser.GameObjects.Text[] = [];
+  private incomePopups: IncomePopup[] = [];
+  private terrainSprite!: Phaser.GameObjects.Image;
+  private pickModel?: (x: number, y: number, faction?: Faction) => number | undefined;
+  private lastUnitClick: { id: number; time: number } | null = null;
   dragStart: Point | null = null;
   dragEnd: Point | null = null;
   keys!: Record<string, Phaser.Input.Keyboard.Key>;
@@ -114,7 +134,12 @@ export class RtsScene extends Phaser.Scene implements GameController {
     this.input.keyboard!.on('keydown-P', () => this.togglePause());
     this.input.keyboard!.on('keydown-SPACE', () => this.focusHome());
     registerController(this);
-    this.events.once('shutdown', () => { if (action() === this) registerController(null); });
+    this.events.once('shutdown', () => {
+      this.defeatedSprites = [];
+      this.incomePopups = [];
+      this.lastUnitClick = null;
+      if (action() === this) registerController(null);
+    });
     this.updateVisibility();
     this.emitSnapshot();
     if (!operation.save) this.message('Escort survivors to HQ. Build a powered farm and hospital, then research the infection cure.');
@@ -205,7 +230,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
     g.generateTexture('battlefield', MAP_W * TILE, MAP_H * TILE);
     g.destroy();
-    this.add.image(0, 0, 'battlefield').setOrigin(0).setScale(1, GROUND_SCALE);
+    this.terrainSprite = this.add.image(0, 0, 'battlefield').setOrigin(0).setScale(1, GROUND_SCALE);
   }
 
   private drawResourceNodes() {
@@ -235,6 +260,44 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
   }
 
+  private showResourceIncome(building: Building, gains: [ResourceKey, number][]) {
+    const chips = gains.map(([key, amount]) => {
+      const { icon, color } = RESOURCE_DEPOSITS[key];
+      return this.add.text(0, 0, `${icon} +${amount}`, {
+        fontFamily: 'monospace', fontSize: '12px', fontStyle: 'bold', resolution: 2,
+        color: `#${color.toString(16).padStart(6, '0')}`, backgroundColor: '#132125',
+        padding: { x: 3, y: 2 },
+      }).setOrigin(0, 1);
+    });
+    const gap = 2;
+    const width = chips.reduce((sum, chip) => sum + chip.width, 0) + (chips.length - 1) * gap;
+    let x = -width / 2;
+    for (const chip of chips) {
+      chip.x = x;
+      x += chip.width + gap;
+    }
+    const originY = building.ty * GROUND_TILE_HEIGHT - 17;
+    const centerX = (building.tx + STRUCTURES[building.kind].size[0] / 2) * TILE;
+    const label = this.add.container(centerX, originY, chips).setDepth(21);
+    this.incomePopups.push({ label, originY, age: 0 });
+  }
+
+  private updateIncomePopups(dt: number) {
+    if (!this.incomePopups.length) return;
+    const zoom = this.cameras.main.zoom;
+    this.incomePopups = this.incomePopups.filter(popup => {
+      popup.age += dt;
+      if (popup.age >= INCOME_POPUP_SECONDS) {
+        popup.label.destroy();
+        return false;
+      }
+      const progress = popup.age / INCOME_POPUP_SECONDS;
+      popup.label.y = popup.originY - 23 * progress / zoom;
+      popup.label.setScale(1 / zoom).setAlpha(Math.min(1, (1 - progress) / .38));
+      return true;
+    });
+  }
+
   private createTextures() {
     const survivors = this.make.graphics({ x: 0, y: 0 });
     for (const [x, y, color] of [[7, 9, 0xc9aa78], [19, 9, 0x91b4a4], [12, 15, 0xa78167], [23, 15, 0xc3b493]]) {
@@ -245,19 +308,32 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
     survivors.generateTexture('survivor-group', 32, 26);
     survivors.destroy();
+    if (N64_VISUALS) {
+      this.textures.remove('survivor-group');
+      createN64SurvivorTexture(this);
+    }
     for (const faction of ['human', 'raider', 'zombie'] as const) {
       for (const kind of Object.keys(UNITS) as UnitKind[]) {
-        if ((faction === 'zombie') === isZombie(kind)) this.createUnitTexture(kind, faction);
+        if ((faction === 'zombie') === isZombie(kind)) {
+          if (N64_VISUALS) createN64UnitTexture(this, kind, faction);
+          else this.createUnitTexture(kind, faction);
+        }
       }
     }
     for (const faction of ['human', 'raider'] as const) {
-      for (const kind of Object.keys(STRUCTURES) as BuildingKind[]) this.createBuildingTexture(kind, faction);
+      for (const kind of Object.keys(STRUCTURES) as BuildingKind[]) {
+        if (N64_VISUALS) {
+          const [width, height] = STRUCTURES[kind].size;
+          createN64BuildingTexture(this, kind, faction, width * TILE, BUILDING_HEADROOM + height * GROUND_TILE_HEIGHT);
+        } else this.createBuildingTexture(kind, faction);
+      }
     }
   }
 
   private spawnSurvivors(data: SurvivorGroupData): SurvivorGroup {
     const y = data.y * GROUND_SCALE;
-    const sprite = this.add.image(data.x, y, 'survivor-group').setOrigin(.5, 21 / 26).setDepth(actorDepth(data.y)).setVisible(false);
+    const sprite = this.add.image(data.x, y, 'survivor-group').setDisplaySize(32, 26).setAlpha(this.pickModel ? 0 : 1)
+      .setOrigin(.5, N64_VISUALS ? .96 : 21 / 26).setDepth(actorDepth(data.y)).setVisible(false);
     const label = this.add.text(data.x, y - 23, data.escortId === null ? `${SURVIVORS_PER_GROUP} SURVIVORS` : `${SURVIVORS_PER_GROUP} FOLLOWING`, {
       color: '#f5dfad', backgroundColor: '#151f22', fontSize: '9px', fontFamily: 'monospace', padding: { x: 3, y: 1 },
     }).setOrigin(.5, 1).setDepth(18).setVisible(false);
@@ -517,15 +593,17 @@ export class RtsScene extends Phaser.Scene implements GameController {
     const def = UNITS[kind], vehicle = Boolean(def.vehicle);
     const extra = faction === 'human' ? 1 + (vehicle ? this.techs.vehicleArmor : this.techs.armor) * .2 : 1;
     const hp = Math.round(def.hp * extra);
-    const sprite = this.add.image(x, y * GROUND_SCALE, `unit-${faction}-${kind}`)
-      .setOrigin(.5, UNIT_FEET / UNIT_HEIGHT).setDepth(actorDepth(y));
+    const sprite = this.add.image(x, y * GROUND_SCALE, `unit-${faction}-${kind}`, N64_VISUALS ? 'idle-0' : undefined)
+      .setDisplaySize(36, UNIT_HEIGHT).setAlpha(this.pickModel ? 0 : 1)
+      .setOrigin(.5, N64_VISUALS ? .9 : UNIT_FEET / UNIT_HEIGHT).setDepth(actorDepth(y));
     const unit: Unit = {
       id: data?.id ?? this.nextId++, kind, faction, x, y,
       hp: data?.hp ?? hp, maxHp: data?.maxHp ?? hp, cooldown: data?.cooldown ?? 0,
       xp: data?.xp ?? (faction === 'human' && !vehicle && this.hasBuilding('academy') ? 1 : 0),
       sprite, path: [], goal: null, attackId: null, nextPath: 0, patrol: false,
       holdingPosition: data?.holdingPosition ?? false, cargo: data?.cargo && { ...data.cargo },
-      gatherTarget: data?.gatherTarget, gatherProgress: 0
+      gatherTarget: data?.gatherTarget, gatherProgress: 0,
+      visual: { pose: 'idle', since: this.elapsed, attackAt: -Infinity, hitAt: -Infinity, workUntil: -Infinity, gait: 'idle', facing: .4 },
     };
     this.units.push(unit);
     return unit;
@@ -535,7 +613,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     const def = STRUCTURES[kind], x = tx * TILE, y = ty * GROUND_TILE_HEIGHT;
     const frontY = y + def.size[1] * GROUND_TILE_HEIGHT;
     const sprite = this.add.image(x, y - BUILDING_HEADROOM, `building-${faction}-${kind}`)
-      .setOrigin(0).setDepth(actorDepth((ty + def.size[1]) * TILE - 4 / GROUND_SCALE));
+      .setOrigin(0).setAlpha(this.pickModel ? 0 : 1).setDepth(actorDepth((ty + def.size[1]) * TILE - 4 / GROUND_SCALE));
     const label = this.add.text(x + def.size[0] * TILE / 2, frontY - 5, def.short,
       { color: '#e6e6d1', fontSize: '9px', fontStyle: 'bold', fontFamily: 'monospace', backgroundColor: '#101a1cdb', padding: { x: 3, y: 1 } })
       .setOrigin(.5, 0).setDepth(18);
@@ -699,7 +777,18 @@ export class RtsScene extends Phaser.Scene implements GameController {
   private pointerPosition(pointer: Phaser.Input.Pointer): Point {
     return this.cameras.main.getWorldPoint(pointer.x, pointer.y);
   }
+  getSurvivorGroups(): readonly SurvivorGroup[] { return this.groups; }
+  useOperationModels(pickModel?: (x: number, y: number, faction?: Faction) => number | undefined) {
+    this.pickModel = pickModel;
+    const alpha = pickModel ? 0 : 1;
+    this.terrainSprite.setAlpha(alpha);
+    for (const entity of [...this.units, ...this.buildings, ...this.groups]) entity.sprite.setAlpha(alpha);
+  }
   private getEntityAt(x: number, y: number, faction?: Faction): Unit | Building | null {
+    if (this.pickModel) {
+      const id = this.pickModel(x, y, faction);
+      return id === undefined ? null : this.findEntity(id);
+    }
     let hit: Unit | Building | null = null;
     for (const entity of [...this.units, ...this.buildings]) {
       const sprite = entity.sprite;
@@ -719,6 +808,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     const { x, y } = this.pointerPosition(pointer);
     const groundY = y / GROUND_SCALE;
     if (pointer.rightButtonDown()) {
+      this.lastUnitClick = null;
       if (this.placement) { this.placement = null; this.emitSnapshot(); return; }
       if (this.selectedType !== 'unit' || !this.selected.length) return;
       const target = this.getEntityAt(x, y);
@@ -752,6 +842,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
     if (!pointer.leftButtonDown()) return;
     if (this.placement) {
+      this.lastUnitClick = null;
       this.placeAt(Math.floor(x / TILE), Math.floor(groundY / TILE));
       return;
     }
@@ -763,6 +854,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     const start = this.dragStart, end = this.pointerPosition(pointer);
     this.dragStart = null; this.dragEnd = null;
     if (near(start, end) > 12) {
+      this.lastUnitClick = null;
       const minX = Math.min(start.x, end.x), minY = Math.min(start.y, end.y);
       const maxX = Math.max(start.x, end.x), maxY = Math.max(start.y, end.y);
       const matched = this.units.filter(u => u.faction === 'human' && u.hp > 0 && u.sprite.x >= minX && u.sprite.x <= maxX &&
@@ -771,8 +863,19 @@ export class RtsScene extends Phaser.Scene implements GameController {
       this.selectedType = matched.length ? 'unit' : null;
     } else {
       const found = this.getEntityAt(end.x, end.y, 'human');
-      this.selected = found ? [found.id] : [];
-      this.selectedType = found ? ('tx' in found ? 'building' : 'unit') : null;
+      if (found && !('tx' in found)) {
+        const previous = this.lastUnitClick;
+        const interval = previous ? pointer.upTime - previous.time : Infinity;
+        const doubleClick = previous?.id === found.id && interval >= 0 && interval <= DOUBLE_CLICK_WINDOW_MS;
+        this.selected = doubleClick ? this.units.filter(unit => unit.faction === found.faction && unit.kind === found.kind &&
+          unit.hp > 0 && near(unit, found) <= NEARBY_SELECTION_RADIUS).map(unit => unit.id) : [found.id];
+        this.selectedType = 'unit';
+        this.lastUnitClick = doubleClick ? null : { id: found.id, time: pointer.upTime };
+      } else {
+        this.selected = found ? [found.id] : [];
+        this.selectedType = found ? 'building' : null;
+        this.lastUnitClick = null;
+      }
     }
     this.emitSnapshot();
   }
@@ -836,7 +939,11 @@ export class RtsScene extends Phaser.Scene implements GameController {
     return closest;
   }
   private findEntity(id: number) { return this.units.find(u => u.id === id && u.hp > 0) ?? this.buildings.find(b => b.id === id && b.hp > 0) ?? null; }
-  private damage(target: Unit | Building, amount: number) { target.hp = Math.max(0, target.hp - amount); }
+  private damage(target: Unit | Building, amount: number) {
+    const previousHp = target.hp;
+    target.hp = Math.max(0, target.hp - amount);
+    if (!('tx' in target) && target.hp < previousHp) target.visual.hitAt = this.elapsed;
+  }
   private tracer(shooter: Unit | Building, target: Unit | Building) {
     const aim = this.entityPos(target);
     const to = { x: aim.x, y: aim.y * GROUND_SCALE - ('tx' in target ? 4 : 12) };
@@ -846,7 +953,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     if (!shooter.sprite.visible || !target.sprite.visible) return;
 
     const turret = 'tx' in shooter;
-    const heavy = turret || shooter.kind === 'tank' || shooter.kind === 'gunner';
+    const heavy = turret || shooter.kind === 'tank' || shooter.kind === 'gunner' || shooter.kind === 'demolition' || shooter.kind === 'mortarCarrier';
     const muzzleReach = turret || shooter.kind === 'rifleman' || shooter.kind === 'raider' ? 13
       : shooter.kind === 'tank' || shooter.kind === 'sniper' ? 16 : shooter.kind === 'gunner' ? 15 : 7;
     const muzzleHeight = turret ? 13 : isVehicle(shooter.kind) ? (shooter.kind === 'tank' ? 17 : 18) : 12;
@@ -896,9 +1003,14 @@ export class RtsScene extends Phaser.Scene implements GameController {
     const def = UNITS[unit.kind];
     let multiplier = 1;
     if (unit.faction === 'human') multiplier += (def.vehicle ? this.techs.vehicleWeapons * .2 : this.techs.weapons * .18) + unit.xp * .025;
-    this.damage(target, Math.round(def.damage * multiplier));
+    const structureMultiplier = 'tx' in target ? def.structureDamageMultiplier ?? 1 : 1;
+    this.damage(target, Math.round(def.damage * multiplier * structureMultiplier));
     unit.cooldown = def.cooldown;
+    unit.visual.attackAt = this.elapsed;
+    const aim = this.entityPos(target);
+    unit.visual.facing = Math.atan2(aim.x - unit.x, aim.y - unit.y);
     if (!isZombie(unit.kind)) this.tracer(unit, target);
+    else if (N64_VISUALS && aim.x !== unit.x) unit.sprite.setFlipX(aim.x < unit.x);
     if (target.hp <= 0) {
       if (unit.faction === 'human') unit.xp = Math.min(10, unit.xp + 1);
       if ('tx' in target && target.kind === 'hq' && target.faction === 'raider') this.message('Raider command center destroyed. Enemy territory weakened.');
@@ -935,6 +1047,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
     unit.path = [];
     unit.gatherProgress += dt;
+    unit.visual.workUntil = this.elapsed + dt;
     if (unit.gatherProgress + 1e-9 < GATHER_SECONDS) return;
     const carried = cargo?.amount ?? 0;
     const amount = Math.min(node.remaining, WORKER_CAPACITY - carried);
@@ -1072,6 +1185,52 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
   }
 
+  private updateUnitVisual(unit: Unit) {
+    const visual = unit.visual;
+    const attackEnd = visual.attackAt + n64PoseDuration('attack');
+    const flinchStart = visual.hitAt >= visual.attackAt ? Math.max(visual.hitAt, attackEnd) : visual.hitAt;
+    let pose: N64UnitPose = visual.gait;
+    if (this.elapsed < attackEnd) pose = 'attack';
+    else if (this.elapsed - flinchStart < n64PoseDuration('flinch')) pose = 'flinch';
+    else if (pose === 'idle' && unit.gatherTarget !== undefined && this.elapsed < visual.workUntil) pose = 'work';
+    if (visual.pose !== pose) visual.since = this.elapsed;
+    visual.pose = pose;
+    const start = pose === 'flinch' ? flinchStart : pose === 'attack' ? visual.attackAt : visual.since;
+    const age = this.elapsed - start + (pose === 'idle' ? (unit.id % 4) / 4 : 0);
+    const frame = n64UnitFrame(pose, age);
+    if (unit.sprite.frame.name !== frame) unit.sprite.setFrame(frame);
+    if (pose === 'flinch') unit.sprite.setTint(0xffa9a0);
+    else if (unit.sprite.isTinted) unit.sprite.clearTint();
+  }
+
+  private retireUnitSprite(unit: Unit) {
+    if (!N64_VISUALS || !unit.sprite.visible) {
+      unit.sprite.destroy();
+      return;
+    }
+    unit.sprite.clearTint().setFrame('death-0').setAlpha(1);
+    this.defeatedSprites.push({
+      sprite: unit.sprite, faction: unit.faction, age: 0,
+      tile: { x: Math.floor(unit.x / TILE), y: Math.floor(unit.y / TILE) },
+    });
+  }
+
+  private updateDefeatedSprites(dt: number) {
+    const duration = n64PoseDuration('death');
+    this.defeatedSprites = this.defeatedSprites.filter(defeated => {
+      const { sprite, faction, tile } = defeated;
+      defeated.age += dt;
+      if (defeated.age >= duration) {
+        sprite.destroy();
+        return false;
+      }
+      sprite.setFrame(n64UnitFrame('death', defeated.age))
+        .setAlpha(Math.min(1, (duration - defeated.age) / .15))
+        .setVisible(faction === 'human' || Boolean(this.visibleTiles[tile.y]?.[tile.x]));
+      return true;
+    });
+  }
+
   private updateSimulation(dt: number) {
     this.elapsed += dt;
     const p = this.powered();
@@ -1094,8 +1253,15 @@ export class RtsScene extends Phaser.Scene implements GameController {
       this.nextIncome = this.elapsed + 4;
       for (const b of this.buildings) {
         if (b.faction !== 'human' || b.hp <= 0) continue;
-        if (!p && STRUCTURES[b.kind].power) continue;
-        for (const [key, amount] of Object.entries(STRUCTURES[b.kind].income ?? {})) this.resources[key as keyof Resources] += amount ?? 0;
+        const { income, power } = STRUCTURES[b.kind];
+        if (!income || (!p && power)) continue;
+        const gains: [ResourceKey, number][] = [];
+        for (const [key, amount] of Object.entries(income)) {
+          const resource = key as ResourceKey;
+          this.resources[resource] += amount ?? 0;
+          if (amount && amount > 0) gains.push([resource, amount]);
+        }
+        if (gains.length) this.showResourceIncome(b, gains);
       }
       // Local workshop and hospital repair, limited by power.
       if (p) for (const b of this.buildings.filter(b => b.faction === 'human' && b.hp > 0)) {
@@ -1127,6 +1293,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
     }
     let occupied: Map<number, Building> | undefined;
     for (const unit of this.units) {
+      unit.visual.gait = 'idle';
       if (unit.hp <= 0 || !unit.path.length) continue;
       if (unit.attackId !== null) {
         const target = this.findEntity(unit.attackId);
@@ -1141,13 +1308,22 @@ export class RtsScene extends Phaser.Scene implements GameController {
       const speed = UNITS[unit.kind].speed * (unit.faction === 'human' && isVehicle(unit.kind) ? 1 + this.techs.engines * .12 : 1);
       const terrain = this.map.tiles[Math.max(0, Math.min(MAP_H - 1, Math.floor(unit.y / TILE)))][Math.max(0, Math.min(MAP_W - 1, Math.floor(unit.x / TILE)))];
       const step = speed * (terrain === 'road' ? 1.22 : 1) * dt;
+      const dx = next.x - unit.x;
+      if (d > 0 && dt > 0) unit.visual.gait = unit.kind === 'runner' || unit.kind === 'scout' || terrain === 'road' || unit.attackId !== null ? 'run' : 'walk';
       if (d <= step + 1) { unit.x = next.x; unit.y = next.y; unit.path.shift(); }
       else { unit.x += (next.x - unit.x) / d * step; unit.y += (next.y - unit.y) / d * step; }
       if (!unit.path.length) unit.goal = null;
-      if (Math.abs(next.x - unit.x) > .5) unit.sprite.setFlipX(next.x < unit.x);
+      if (N64_VISUALS) {
+        if (Math.abs(dx) > .5 && this.elapsed - unit.visual.attackAt >= n64PoseDuration('attack')) unit.sprite.setFlipX(dx < 0);
+      } else if (Math.abs(next.x - unit.x) > .5) unit.sprite.setFlipX(next.x < unit.x);
       unit.sprite.setPosition(unit.x, unit.y * GROUND_SCALE).setDepth(actorDepth(unit.y));
     }
-    for (const unit of this.units.filter(u => u.hp <= 0)) { unit.sprite.destroy(); this.selected = this.selected.filter(id => id !== unit.id); }
+    for (const unit of this.units) {
+      if (unit.hp <= 0) {
+        this.retireUnitSprite(unit);
+        this.selected = this.selected.filter(id => id !== unit.id);
+      } else if (N64_VISUALS) this.updateUnitVisual(unit);
+    }
     this.units = this.units.filter(u => u.hp > 0);
     for (const b of this.buildings.filter(b => b.hp <= 0)) { b.sprite.destroy(); b.label.destroy(); this.selected = this.selected.filter(id => id !== b.id); }
     this.buildings = this.buildings.filter(b => b.hp > 0);
@@ -1188,7 +1364,7 @@ export class RtsScene extends Phaser.Scene implements GameController {
         }
       }
     };
-    for (const u of this.units) if (u.faction === 'human' && u.hp > 0) reveal(u, isVehicle(u.kind) ? 8 : 7);
+    for (const u of this.units) if (u.faction === 'human' && u.hp > 0) reveal(u, UNITS[u.kind].sight ?? (isVehicle(u.kind) ? 8 : 7));
     for (const b of this.buildings) if (b.faction === 'human' && b.hp > 0) {
       reveal(b, b.kind === 'radar' ? 19 : b.kind === 'hq' ? 10 : 6);
     }
@@ -1230,6 +1406,18 @@ export class RtsScene extends Phaser.Scene implements GameController {
       displayedRanges.add(range);
       const pos = this.entityPos(entity);
       ground.strokeEllipse(pos.x, pos.y * GROUND_SCALE, 2 * range, 2 * range * GROUND_SCALE);
+    }
+    if (!this.pickModel) {
+      ground.lineStyle(2, 0xcce9a1, .9);
+      for (const entity of selection) {
+        if ('tx' in entity || entity.faction !== 'human' || !entity.path.length) continue;
+        ground.beginPath();
+        ground.moveTo(entity.x, entity.y * GROUND_SCALE);
+        for (const waypoint of entity.path) ground.lineTo(waypoint.x, waypoint.y * GROUND_SCALE);
+        ground.strokePath();
+        const destination = entity.path[entity.path.length - 1];
+        ground.strokeEllipse(destination.x, destination.y * GROUND_SCALE, 10, 7);
+      }
     }
     for (const found of selection) {
       ground.lineStyle(2, 0xb6eaa4, .9);
@@ -1278,8 +1466,12 @@ export class RtsScene extends Phaser.Scene implements GameController {
       if (this.keys.A?.isDown || this.keys.LEFT?.isDown) camera.scrollX -= speed;
       if (this.keys.D?.isDown || this.keys.RIGHT?.isDown) camera.scrollX += speed;
     }
-    if (!this.pausedByPlayer && this.status === 'playing') this.updateSimulation(dt);
+    if (!this.pausedByPlayer) {
+      if (this.status === 'playing') this.updateSimulation(dt);
+      if (this.defeatedSprites.length) this.updateDefeatedSprites(dt);
+    }
     this.drawShots(this.pausedByPlayer ? 0 : dt);
+    this.updateIncomePopups(this.pausedByPlayer ? 0 : dt);
     this.drawSelectionAndPreview();
   }
   private emitSnapshot() {

@@ -1,21 +1,21 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import Phaser from 'phaser';
 import { version } from '../package.json';
+import type { mountOperation3d } from './game/operation3d';
 import { RtsScene } from './game/RtsScene';
 import { action, clearSnapshot, getSnapshot, subscribe } from './game/bridge';
 import { environmentForSeed } from './game/map';
-import { ENVIRONMENT_LABELS, STORAGE_KEY, RESOURCE_DEPOSITS, STRUCTURES, SURVIVOR_TARGET, TERRAIN_COLORS, TECH, UNITS, fmtCost, type BuildingKind, type GameSave, type TechId, type UiSnapshot, type UnitKind } from './game/model';
+import { ENVIRONMENT_LABELS, STORAGE_KEY, RESOURCE_DEPOSITS, STRUCTURES, SURVIVOR_TARGET, TERRAIN_COLORS, TECH, UNITS, fmtCost, type BuildingKind, type Cost, type GameSave, type ResourceKey, type TechId, type UiSnapshot, type UnitKind } from './game/model';
 import './styles.css';
 
 type Tab = 'build' | 'units' | 'research';
 type Session = { id: number; seed: string; save?: GameSave };
 const COMMAND_LABELS: Record<Tab, string> = { build: 'Construct', units: 'Produce', research: 'Research' };
-const GROUPS: { title: string; kinds: BuildingKind[] }[] = [
-  { title: 'Command & infrastructure', kinds: ['power', 'depot', 'scrapyard', 'refinery', 'farm', 'radar'] },
-  { title: 'Military production', kinds: ['barracks', 'warFactory', 'armory', 'academy'] },
-  { title: 'Research & maintenance', kinds: ['research', 'garage', 'hospital', 'workshop'] },
-  { title: 'Defensive fortifications', kinds: ['turret', 'wall'] }
+const BUILD_OPTIONS: BuildingKind[] = [
+  'power', 'depot', 'scrapyard', 'refinery', 'farm', 'radar', 'barracks', 'warFactory',
+  'armory', 'academy', 'research', 'garage', 'hospital', 'workshop', 'turret', 'wall',
 ];
+const PRODUCE_OPTIONS = (Object.keys(UNITS) as UnitKind[]).filter(kind => UNITS[kind].building);
 function getSave(): GameSave | null {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
@@ -28,27 +28,75 @@ function hhmm(seconds: number) {
   const mm = Math.floor(seconds / 60), ss = Math.floor(seconds % 60);
   return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
-function canBuy(snapshot: UiSnapshot, cost: Partial<Record<'scrap' | 'oil' | 'food', number>>) {
+function canBuy(snapshot: UiSnapshot, cost: Cost) {
   return Object.entries(cost).every(([k, v]) => snapshot.resources[k as keyof typeof snapshot.resources] >= (v ?? 0));
 }
 
 function GameCanvas({ session }: { session: Session }) {
   const host = useRef<HTMLDivElement>(null);
+  const worldHost = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!host.current) return;
+    const overlay = host.current;
+    const world = worldHost.current;
+    if (!overlay || !world) return;
+    overlay.style.visibility = 'hidden';
     const scene = new RtsScene(session.seed, session.save);
     const game = new Phaser.Game({
       type: Phaser.AUTO,
-      parent: host.current,
-      backgroundColor: '#101a1c',
+      parent: overlay,
+      transparent: true,
       render: { pixelArt: true, antialias: false },
       scale: { mode: Phaser.Scale.RESIZE, width: 1024, height: 700, autoCenter: Phaser.Scale.CENTER_BOTH },
       scene: [scene],
       fps: { target: 60, forceSetTimeOut: false }
     });
-    return () => { game.destroy(true); clearSnapshot(); };
+    const frame = Phaser.Core.Events.POST_RENDER;
+    let active = true;
+    let presentation: ReturnType<typeof mountOperation3d> | undefined;
+    let connect: (() => void) | undefined;
+    const useFallback = (error: unknown) => {
+      game.events.off(frame, render);
+      presentation?.dispose();
+      presentation = undefined;
+      overlay.style.visibility = '';
+      console.warn('3D renderer unavailable. Using the 2D battlefield.', error);
+    };
+    function render() {
+      try { presentation?.render(); }
+      catch (error) { useFallback(error); }
+    }
+    void import('./game/operation3d').then(({ mountOperation3d }) => {
+      if (!active) return;
+      connect = () => {
+        if (!scene.map || !scene.sys.isActive()) return;
+        game.events.off(frame, connect);
+        try {
+          presentation = mountOperation3d(world, scene);
+          game.events.on(frame, render);
+          overlay.style.visibility = '';
+        } catch (error) {
+          useFallback(error);
+        }
+      };
+      game.events.on(frame, connect);
+    }).catch(error => {
+      if (active) useFallback(error);
+    });
+    return () => {
+      active = false;
+      if (connect) game.events.off(frame, connect);
+      game.events.off(frame, render);
+      if (presentation) {
+        presentation.dispose();
+      }
+      game.destroy(true);
+      clearSnapshot();
+    };
   }, [session]);
-  return <div className="game-canvas" ref={host} role="application" aria-label="Deadzone Command battlefield" />;
+  return <div className="game-canvas" role="application" aria-label="Deadzone Command battlefield">
+    <div className="operation-world" ref={worldHost} aria-hidden="true" />
+    <div className="operation-overlay" ref={host} />
+  </div>;
 }
 
 function Minimap({ snapshot }: { snapshot: UiSnapshot }) {
@@ -175,49 +223,73 @@ function ProductionQueue({ snapshot }: { snapshot: UiSnapshot }) {
   </section>;
 }
 
+function CommandTile({ label, description, cost, detail, locked, selected, onClick }: {
+  label: string; description: string; cost?: Cost; detail?: string; locked?: string; selected?: boolean; onClick: () => void;
+}) {
+  return <button className="command-tile" onClick={onClick} disabled={Boolean(locked)} aria-pressed={selected}
+    aria-label={[label, cost && fmtCost(cost), detail, locked].filter(Boolean).join(', ')}
+    title={locked ? `${locked}. ${description}` : description}>
+    <strong>{label}</strong>
+    <span className="command-tile-meta">
+      {cost && <span className="command-tile-cost" aria-hidden="true">
+        {(Object.entries(cost) as [ResourceKey, number][]).map(([key, amount]) => <span key={key} data-resource={key}>
+          {RESOURCE_DEPOSITS[key].icon}{amount}
+        </span>)}
+      </span>}
+      {detail && <small>{detail}</small>}
+    </span>
+    {locked && <small className="command-tile-lock">{locked}</small>}
+  </button>;
+}
+
 function CommandMenu({ snapshot, tab, onClose, onPlace }: { snapshot: UiSnapshot; tab: Tab; onClose: () => void; onPlace: (kind: BuildingKind) => void }) {
-  const buildingCounts = Object.fromEntries(snapshot.buildings.map(x => [x.kind, x.count]));
-  return (
-    <section id="command-menu" className="command-panel" aria-labelledby="command-title">
-      <header className="command-panel-header">
-        <h2 id="command-title">{COMMAND_LABELS[tab]}</h2>
-        <button className="command-close" aria-label={`Close ${COMMAND_LABELS[tab]} menu`} onClick={onClose}>×</button>
-      </header>
-      <div className="panel-scroll">
-        {tab === 'build' && GROUPS.map(group => <div className="action-group" key={group.title}>
-          <h3>{group.title}</h3>
-          {group.kinds.map(kind => {
-            const def = STRUCTURES[kind]; const locked = !!def.requires && !buildingCounts[def.requires];
-            const disabled = locked || !canBuy(snapshot, def.cost) || snapshot.status !== 'playing';
-            return <button className={`action-item ${snapshot.placement === kind ? 'chosen' : ''}`} key={kind} onClick={() => onPlace(kind)} disabled={disabled} title={def.description}>
-              <span className="action-icon">{def.short}</span><span className="action-text"><strong>{def.label}</strong><small>{locked ? `Requires ${STRUCTURES[def.requires!].label}` : def.description}</small><em>{fmtCost(def.cost)}</em></span><span className="action-count">{buildingCounts[kind] || '+'}</span>
-            </button>;
-          })}
-        </div>)}
-        {tab === 'units' && <div className="action-group"><h3>Available units</h3>
-          {(['worker', 'rifleman', 'gunner', 'sniper', 'apc', 'tank'] as UnitKind[]).map(kind => {
-            const def = UNITS[kind]; const locked = !def.building || !buildingCounts[def.building];
-            return <button className="action-item" key={kind} disabled={locked || !canBuy(snapshot, def.cost) || snapshot.powerProduced < snapshot.powerUsed || snapshot.status !== 'playing'} onClick={() => action()?.train(kind)}>
-              <span className="action-icon">{kind === 'worker' ? 'WRK' : def.vehicle ? 'VHC' : 'INF'}</span><span className="action-text"><strong>{def.label}</strong><small>{locked ? `Requires ${STRUCTURES[def.building!].label}` : def.description}</small><em>{fmtCost(def.cost)} · {def.buildTime}s</em></span><span className="action-count">+</span>
-            </button>;
-          })}
-        </div>}
-        {tab === 'research' && <div className="action-group"><h3>Technology development</h3>
-          {Object.entries(TECH).map(([key, def]) => {
-            const id = key as TechId, level = snapshot.techs[id];
-            const cost = Object.fromEntries(Object.entries(def.cost).map(([k, v]) => [k, Math.ceil((v ?? 0) * (1 + level * .6))]));
-            const locked = !buildingCounts[def.requires];
-            return <button className="action-item" key={id} disabled={locked || !!snapshot.research || level >= def.max || !canBuy(snapshot, cost) || snapshot.status !== 'playing'} onClick={() => action()?.researchTechnology(id)}>
-              <span className="action-icon tech-icon">{level}/{def.max}</span><span className="action-text"><strong>{def.label}</strong><small>{locked ? `Requires ${STRUCTURES[def.requires].label}` : def.description}</small><em>{level >= def.max ? 'MAXIMUM LEVEL' : fmtCost(cost)}</em></span><span className="action-count">{level === def.max ? '✓' : '→'}</span>
-            </button>;
-          })}
-          <h3>Active project</h3>
-          {snapshot.research ? <div className="research-status"><strong>{TECH[snapshot.research.id].label}</strong><span>{Math.ceil(snapshot.research.remaining)}s remaining</span></div> : <p className="muted">No active research project.</p>}
-          <h3>Vehicle garage</h3><button className="garage-button" disabled={!buildingCounts.garage || snapshot.resources.scrap < 25} onClick={() => action()?.repairVehicles()}>REPAIR NEARBY VEHICLES <span>25 SCRAP</span></button>
-        </div>}
-      </div>
-    </section>
-  );
+  const buildingCounts = Object.fromEntries(snapshot.buildings.map(({ kind, count }) => [kind, count]));
+  const unavailable = snapshot.paused || snapshot.status !== 'playing' ? 'Operation inactive' : undefined;
+  const lowPower = snapshot.powerProduced < snapshot.powerUsed ? 'Low power' : undefined;
+  const requires = (kind?: BuildingKind) => kind && !buildingCounts[kind] ? `Requires ${STRUCTURES[kind].label}` : undefined;
+  const costLock = (cost: Cost) => canBuy(snapshot, cost) ? undefined : 'Need resources';
+  const research = snapshot.research;
+  const repairCost = { scrap: 25 };
+
+  return <section id="command-menu" className="command-panel" aria-labelledby="command-title">
+    <header className="command-panel-header">
+      <h2 id="command-title">{COMMAND_LABELS[tab]}</h2>
+      <button className="command-close" aria-label={`Close ${COMMAND_LABELS[tab]} actions`} onClick={onClose}>×</button>
+    </header>
+    <div className="command-grid">
+      {tab === 'build' && BUILD_OPTIONS.map(kind => {
+        const def = STRUCTURES[kind];
+        return <CommandTile key={kind} label={def.label} description={def.description} cost={def.cost}
+          detail={buildingCounts[kind] ? `${buildingCounts[kind]} built` : undefined}
+          selected={snapshot.placement === kind} locked={unavailable ?? requires(def.requires) ?? costLock(def.cost)}
+          onClick={() => onPlace(kind)} />;
+      })}
+      {tab === 'units' && PRODUCE_OPTIONS.map(kind => {
+        const def = UNITS[kind];
+        return <CommandTile key={kind} label={def.label} description={def.description} cost={def.cost}
+          detail={`${def.buildTime}s`} locked={unavailable ?? requires(def.building) ?? lowPower ?? costLock(def.cost)}
+          onClick={() => action()?.train(kind)} />;
+      })}
+      {tab === 'research' && <>
+        {(Object.keys(TECH) as TechId[]).map(id => {
+          const def = TECH[id];
+          const level = snapshot.techs[id];
+          const maxed = level >= def.max;
+          const cost = Object.fromEntries(Object.entries(def.cost).map(([key, value]) => [key, Math.ceil((value ?? 0) * (1 + level * .6))]));
+          const locked = maxed ? 'Max level' : unavailable ?? requires(def.requires) ??
+            (research ? 'Research active' : undefined) ?? lowPower ?? costLock(cost);
+          return <CommandTile key={id} label={def.label} description={def.description} cost={maxed ? undefined : cost}
+            detail={`${level}/${def.max}`} locked={locked} onClick={() => action()?.researchTechnology(id)} />;
+        })}
+        <CommandTile label="Repair Nearby Vehicles" description="Repair damaged vehicles near a Vehicle Garage."
+          cost={repairCost} locked={unavailable ?? requires('garage') ?? costLock(repairCost)}
+          onClick={() => action()?.repairVehicles()} />
+      </>}
+    </div>
+    {tab === 'research' && research && <div className="command-research-status">
+      <strong>{TECH[research.id].label}</strong><span>{Math.ceil(research.remaining)}s remaining</span>
+    </div>}
+  </section>;
 }
 
 function Battlefield({ session, exit }: { session: Session; exit: () => void }) {
@@ -239,9 +311,9 @@ function Battlefield({ session, exit }: { session: Session; exit: () => void }) 
     <header className="top-bar">
       <div className="brand-small"><span className="brand-emblem">D/C</span><span>DEADZONE <strong>COMMAND</strong></span><span className="build-marker">V{version}</span></div>
       <div className="resource-bar">
-        <div className="resource"><span className="resource-symbol metal">◈</span><span>SCRAP</span><strong>{Math.floor(snapshot?.resources.scrap ?? 0)}</strong></div>
-        <div className="resource"><span className="resource-symbol oil">●</span><span>OIL</span><strong>{Math.floor(snapshot?.resources.oil ?? 0)}</strong></div>
-        <div className="resource"><span className="resource-symbol food">◆</span><span>FOOD</span><strong>{Math.floor(snapshot?.resources.food ?? 0)}</strong></div>
+        <div className="resource"><span className="resource-symbol metal">{RESOURCE_DEPOSITS.scrap.icon}</span><span>SCRAP</span><strong>{Math.floor(snapshot?.resources.scrap ?? 0)}</strong></div>
+        <div className="resource"><span className="resource-symbol oil">{RESOURCE_DEPOSITS.oil.icon}</span><span>OIL</span><strong>{Math.floor(snapshot?.resources.oil ?? 0)}</strong></div>
+        <div className="resource"><span className="resource-symbol food">{RESOURCE_DEPOSITS.food.icon}</span><span>FOOD</span><strong>{Math.floor(snapshot?.resources.food ?? 0)}</strong></div>
         <div className={`resource power ${snapshot && snapshot.powerProduced < snapshot.powerUsed ? 'power-low' : ''}`}><span className="resource-symbol">⚡</span><span>POWER</span><strong>{snapshot?.powerUsed ?? 0}/{snapshot?.powerProduced ?? 0}</strong></div>
       </div>
       <div className="header-buttons"><span className="timer">{hhmm(snapshot?.elapsed ?? 0)}</span><button onClick={() => setHelp(v => !v)} title="Controls and help">?</button><button onClick={() => action()?.saveGame()} title="Save operation">SAVE</button><button onClick={() => action()?.togglePause()}>{snapshot?.paused ? 'RESUME' : 'PAUSE'}</button><button onClick={() => setConfirmExit(true)} title="Return to main menu">MENU</button></div>
@@ -295,7 +367,7 @@ function Battlefield({ session, exit }: { session: Session; exit: () => void }) 
             ? `All ${SURVIVOR_TARGET} survivors reached your settlement, and the infection cure is ready.` : 'Your operation is complete.'}</p>
           <button onClick={exit}>RETURN TO MAIN MENU</button>
         </div>}
-        {help && <div className="help-overlay"><button className="close-help" onClick={() => setHelp(false)}>✕</button><h2>TACTICAL FIELD GUIDE</h2><p><b>Left click:</b> select unit or structure. Drag to select an army. Selected ranged units show their firing range.</p><p><b>Right click:</b> move selected units. Right-click an enemy to attack it.</p><p><b>WASD / arrow keys:</b> pan camera. <b>Mouse wheel:</b> zoom.</p><p><b>Construct:</b> open the bottom-center Construct menu, choose a building, then click a clear tile near your base.</p><p><b>Produce:</b> train workers at HQ, infantry at Barracks, and armor at the War Factory.</p><p><b>Gather:</b> select a worker and right-click metal, oil, or food. Workers haul resources back automatically.</p><p><b>Hold Position:</b> keep troops in cover to fire when enemies come into view.</p><p><b>Research:</b> build Research Institute or Vehicle Garage to unlock technology.</p><p><b>Minimap:</b> click to jump to another sector.</p><p><b>P:</b> pause. <b>ESC:</b> cancel placement. <b>Space:</b> center home.</p><p className="muted"><b>Survivors:</b> move an armed unit near a group, then lead them back to your command center. Build a powered farm and hospital and complete the infection cure to win.</p></div>}
+        {help && <div className="help-overlay"><button className="close-help" onClick={() => setHelp(false)}>✕</button><h2>TACTICAL FIELD GUIDE</h2><p><b>Left click:</b> select unit or structure. Drag to select a group. Double-click a unit to select nearby allies of the same type. Selected ranged units show their firing range.</p><p><b>Right click:</b> move selected units. Right-click an enemy to attack it.</p><p><b>WASD / arrow keys:</b> pan camera. <b>Mouse wheel:</b> zoom.</p><p><b>Construct:</b> choose a building tile in the bottom HUD, then click clear ground near your base.</p><p><b>Produce:</b> train workers at HQ, infantry at Barracks, and armor at the War Factory.</p><p><b>Gather:</b> select a worker and right-click metal, oil, or food. Workers haul resources back automatically.</p><p><b>Hold Position:</b> keep troops in cover to fire when enemies come into view.</p><p><b>Research:</b> build Research Institute or Vehicle Garage to unlock technology.</p><p><b>Minimap:</b> click to jump to another sector.</p><p><b>P:</b> pause. <b>ESC:</b> cancel placement. <b>Space:</b> center home.</p><p className="muted"><b>Survivors:</b> move an armed unit near a group, then lead them back to your command center. Build a powered farm and hospital and complete the infection cure to win.</p></div>}
         {confirmExit && <div className="dialog-backdrop"><div className="exit-dialog"><h3>RETURN TO MAIN MENU?</h3><p>Unsaved progress will be lost. Use SAVE before leaving if you want to continue this operation later.</p><div><button onClick={() => setConfirmExit(false)}>CANCEL</button><button onClick={exit}>LEAVE OPERATION</button></div></div></div>}
       </section>
     </div>
@@ -305,5 +377,7 @@ function Battlefield({ session, exit }: { session: Session; exit: () => void }) 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const newGame = (seed: string, save?: GameSave) => setSession({ id: Date.now(), seed, save });
-  return session ? <Battlefield key={session.id} session={session} exit={() => setSession(null)} /> : <Menu onStart={seed => newGame(seed)} onContinue={() => { const save = getSave(); if (save) newGame(save.seed, save); }} />;
+  if (session) return <Battlefield key={session.id} session={session} exit={() => setSession(null)} />;
+  return <Menu onStart={seed => newGame(seed)}
+    onContinue={() => { const save = getSave(); if (save) newGame(save.seed, save); }} />;
 }
